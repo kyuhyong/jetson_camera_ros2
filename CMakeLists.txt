@@ -58,6 +58,8 @@ if(${ARCHITECTURE} STREQUAL "aarch64")
   add_executable(jetson_camera_driver_node
     src/jetson_camera_driver_node.cpp
   )
+
+  # this need to be declared for generating executable
   target_link_libraries(jetson_camera_driver_node
     jetson_camera_driver
   )
@@ -72,6 +74,7 @@ if(${ARCHITECTURE} STREQUAL "aarch64")
     jetson_camera_driver_node
     DESTINATION lib/${PROJECT_NAME}
   )
+  
   # Install launch files.
   install(DIRECTORY
     launch
