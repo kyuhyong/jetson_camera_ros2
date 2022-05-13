@@ -16,15 +16,32 @@ using namespace std::chrono_literals;
 
 namespace jetson_camera_driver
 {
-
+std::string mat_type2encoding(int mat_type)
+{
+    switch (mat_type) {
+    case CV_8UC1:
+        return "mono8";
+    case CV_8UC3:
+        return "bgr8";
+    case CV_16SC1:
+        return "mono16";
+    case CV_8UC4:
+        return "rgba8";
+    default:
+        throw std::runtime_error("unsupported encoding type");
+    }
+}
 std::string get_tegra_pipeline(int width, int height, int fps) {
     return "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=(int)" + std::to_string(width) + ", height=(int)" +
         std::to_string(height) + ", format=(string)NV12, framerate=(fraction)" + std::to_string(fps) +
         "/1 ! nvvidconv flip-method=0 ! video/x-raw, format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink";
 }
 
-JetsonCameraDriver::JetsonCameraDriver(const rclcpp::NodeOptions &node_options) : Node("jetson_camera_driver", node_options)
+JetsonCameraDriver::JetsonCameraDriver(const rclcpp::NodeOptions &node_options) : 
+    Node("jetson_camera_driver", node_options),
+    canceled_(false)
 {
+    RCLCPP_INFO(get_logger(), "Node start");
     frame_id_ = this->declare_parameter("frame_id", "camera");
     image_width_ = this->declare_parameter("image_width", 1280);
     image_height_ = this->declare_parameter("image_height", 720);
@@ -34,103 +51,113 @@ JetsonCameraDriver::JetsonCameraDriver(const rclcpp::NodeOptions &node_options) 
     camera_id = this->declare_parameter("camera_id", 0);
 
     rmw_qos_profile_t custom_qos_profile = rmw_qos_profile_sensor_data;
-    camera_info_pub_ = image_transport::create_camera_publisher(this, "image", custom_qos_profile);
+    pub_camera_transport_ = image_transport::create_camera_publisher(this, "image", custom_qos_profile);
     cinfo_manager_ = std::make_shared<camera_info_manager::CameraInfoManager>(this);
 
-    /* get ROS2 config parameter for camera calibration file */
-    //auto camera_calibration_file_param_ = this->declare_parameter("camera_calibration_file", "file://config/camera.yaml");
-    //cinfo_manager_->loadCameraInfo(camera_calibration_file_param_);
-
+    pub_image_ = this->create_publisher<sensor_msgs::msg::Image>("image_raw", 10);
     //pipeline_ = gstreamer_pipeline(image_width_, image_height_, width_, height_, fps_, flip_method_);
     pipeline_ = get_tegra_pipeline(image_width_, image_height_, fps_);
+    
+#ifdef USE_LOOP_THREAD
+    RCLCPP_INFO(get_logger(), "Pipeline start");
+    //capture_ = std::make_shared<cv::VideoCapture>(camera_id);
+    //capture_->open(pipeline_, cv::CAP_GSTREAMER);
+    next_stamp_ = now();
+    RCLCPP_INFO(get_logger(), "Loop bind");
+    thread_ = std::thread(std::bind(&JetsonCameraDriver::LoopThread, this));
+    RCLCPP_INFO(get_logger(), "start publishing");
+#else
     cap_.open(pipeline_, cv::CAP_GSTREAMER);
     last_frame_ = std::chrono::steady_clock::now();
     timer_ = this->create_wall_timer(1ms, std::bind(&JetsonCameraDriver::ImageCallback, this));
+#endif
 }
 
-std::shared_ptr<sensor_msgs::msg::Image> JetsonCameraDriver::ConvertFrameToMessage(cv::Mat &frame)
+JetsonCameraDriver::~JetsonCameraDriver()
 {
-    std_msgs::msg::Header header_;
-    sensor_msgs::msg::Image ros_image;
-
-    // Make sure output in the size the user wants even if it is not native
-    if(frame.rows != image_width_ || frame.cols != image_height_){
-        cv::resize(frame, frame, cv::Size(image_width_, image_height_));
+    // Stop loop
+    canceled_.store(true);
+    if (thread_.joinable()) {
+      thread_.join();
     }
+}
 
-    /* To remove CV-bridge and boost-python3 dependencies, this is pretty much a copy of the toImageMsg method in cv_bridge. */
-    ros_image.header = header_;
-    ros_image.height = frame.rows;
-    ros_image.width = frame.cols;
-    ros_image.encoding = "bgr8";
-    /* FIXME c++20 has std::endian */
-    // ros_image.is_bigendian = (std::endian::native == std::endian::big);
-    ros_image.is_bigendian = false;
-    ros_image.step = frame.cols * frame.elemSize();
-    size_t size = ros_image.step * frame.rows;
-    ros_image.data.resize(size);
-
-    if (frame.isContinuous())
-    {
-        memcpy(reinterpret_cast<char *>(&ros_image.data[0]), frame.data, size);
-    }
-    else
-    {
-        // Copy by row by row
-        uchar *ros_data_ptr = reinterpret_cast<uchar *>(&ros_image.data[0]);
-        uchar *cv_data_ptr = frame.data;
-        for (int i = 0; i < frame.rows; ++i)
-        {
-            memcpy(ros_data_ptr, cv_data_ptr, ros_image.step);
-            ros_data_ptr += ros_image.step;
-            cv_data_ptr += frame.step;
+#ifdef USE_LOOP_THREAD
+void JetsonCameraDriver::LoopThread(void)
+{
+    std::string pipeline = get_tegra_pipeline(image_width_, image_height_, fps_);
+    RCLCPP_INFO(get_logger(), "Pipeline: %s", pipeline.c_str());
+    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
+    //cv::Mat frame;
+    cv_bridge::CvImage img;
+    img.header.frame_id = frame_id_;
+    img.encoding = sensor_msgs::image_encodings::BGR8;
+    RCLCPP_INFO(get_logger(), "LoopThread Start!!");
+    
+    while (rclcpp::ok() && !canceled_.load()) {
+        if (cap.read(img.image)) {
+            
+            auto stamp = now();
+            
+            // Convert OpenCV Mat to ROS Image
+            img.header.stamp = stamp;
+            //img.step = static_cast<sensor_msgs::msg::Image::_step_type>(frame.step);
+            //img.data.assign(frame.datastart, frame.dataend);
+            pub_image_->publish(*img.toImageMsg());
         }
     }
-    auto msg_ptr_ = std::make_shared<sensor_msgs::msg::Image>(ros_image);
-    return msg_ptr_;
-}
 
+}
+#else
 void JetsonCameraDriver::ImageCallback()
 {
     //std::string pipeline = gstreamer_pipeline(image_width_, image_height_, width_, height_, fps_, flip_method_);
     //cv::VideoCapture cap(pipeline_, cv::CAP_GSTREAMER);
     cap_ >> frame;
     //cap_.read(frame);
+    cv_bridge::CvImagePtr cv_prt;
     auto now = std::chrono::steady_clock::now();
 
     if (!frame.empty() &&
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_).count() > 1/fps_*1000)
     {
+        sensor_msgs::msg::Image::SharedPtr msg =
+            cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame)
+                .toImageMsg();
+        
+        pub_image_->publish(*msg.get());
         last_frame_ = now;
 
         // Convert to a ROS2 image
         if (!is_flipped)
         {
-            image_msg_ = ConvertFrameToMessage(frame);
+            msg_image_ = ConvertFrameToMessage(frame);
         }
         else
         {
             // Flip the frame if needed
             //cv::flip(frame, flipped_frame, 1);
-            image_msg_ = ConvertFrameToMessage(frame);
+            msg_image_ = ConvertFrameToMessage(frame);
         }
 
         // Put the message into a queue to be processed by the middleware.
         // This call is non-blocking.
-        sensor_msgs::msg::CameraInfo::SharedPtr camera_info_msg_(
+        sensor_msgs::msg::CameraInfo::SharedPtr msg_camera_info_(
             new sensor_msgs::msg::CameraInfo(cinfo_manager_->getCameraInfo()));
 
         rclcpp::Time timestamp = this->get_clock()->now();
 
-        image_msg_->header.stamp = timestamp;
-        image_msg_->header.frame_id = frame_id_;
+        msg_image_->header.stamp = timestamp;
+        msg_image_->header.frame_id = frame_id_;
 
-        camera_info_msg_->header.stamp = timestamp;
-        camera_info_msg_->header.frame_id = frame_id_;
+        msg_camera_info_->header.stamp = timestamp;
+        msg_camera_info_->header.frame_id = frame_id_;
 
-        camera_info_pub_.publish(image_msg_, camera_info_msg_);
+        pub_camera_info_.publish(msg_image_, msg_camera_info_);
     }
 }
+#endif
+
 
 } // namespace jetson_camera_driver
 

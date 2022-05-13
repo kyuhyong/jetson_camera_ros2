@@ -30,6 +30,7 @@ find_package(std_msgs                   REQUIRED)
 find_package(sensor_msgs                REQUIRED)
 find_package(camera_info_manager        REQUIRED)
 find_package(image_transport            REQUIRED)
+find_package(cv_bridge                  REQUIRED)
 find_package(camera_calibration_parsers REQUIRED)
 find_package(OpenCV 4                   REQUIRED)
 
@@ -50,6 +51,7 @@ if(${ARCHITECTURE} STREQUAL "aarch64")
     "camera_info_manager"
     "image_transport"
     "camera_calibration_parsers"
+    "cv_bridge"
     "OpenCV")
 
   rclcpp_components_register_nodes(jetson_camera_driver "jetson_camera_driver::JetsonCameraNode")
